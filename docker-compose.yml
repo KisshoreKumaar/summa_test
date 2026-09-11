@@ -1,0 +1,116 @@
+# Everything for this project runs in containers — nothing is installed or
+# served on the host.
+#
+#   docker compose up web                  → dev server at http://localhost:3000
+#   docker compose run --rm ci             → typecheck + lint
+#   docker compose run --rm seed           → seed dummy students
+#   docker compose --env-file .env.local --profile prod up web-prod
+#                                          → production build, port 3001
+#
+# The prod profile needs --env-file because Compose interpolates build args from
+# the shell and `.env` only; `env_file:` applies at runtime, not at build time.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Dev server with hot reload. Source is bind-mounted; node_modules and .next
+  # stay in named volumes so host and container never fight over them.
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    environment:
+      - WATCHPACK_POLLING=true   # reliable file watching across the bind mount
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+      - next_cache:/app/.next
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # Typecheck + lint. Exits non-zero on failure, so it doubles as a CI gate.
+  # ---------------------------------------------------------------------------
+  ci:
+    build:
+      context: .
+      target: ci
+    env_file:
+      - .env.local
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+      - next_cache_ci:/app/.next
+
+  # ---------------------------------------------------------------------------
+  # Seed script. Needs SUPABASE_SERVICE_ROLE_KEY in .env.local.
+  # ---------------------------------------------------------------------------
+  seed:
+    build:
+      context: .
+      target: ci
+    env_file:
+      - .env.local
+    command: npm run seed
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+
+  # ---------------------------------------------------------------------------
+  # Production image. Started only with: docker compose --profile prod up
+  # ---------------------------------------------------------------------------
+  web-prod:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: runner
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL}
+        NEXT_PUBLIC_COLLEGE_EMAIL_DOMAIN: ${NEXT_PUBLIC_COLLEGE_EMAIL_DOMAIN}
+    ports:
+      - "3001:3000"
+    env_file:
+      - .env.local
+
+  # ---------------------------------------------------------------------------
+  # Throwaway Postgres for validating migrations before they touch Supabase.
+  # Stubs out the auth/storage objects Supabase normally provides.
+  #   docker compose run --rm db-validate
+  # ---------------------------------------------------------------------------
+  db-validate:
+    profiles: ["tools"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: validate
+      POSTGRES_DB: validate
+    volumes:
+      - ./supabase:/supabase:ro
+      - ./scripts/validate-migrations.sh:/validate.sh:ro
+      - ./scripts/test-rls.sh:/test-rls.sh:ro
+    entrypoint: ["/bin/sh", "/validate.sh"]
+
+  # ---------------------------------------------------------------------------
+  # Behavioural tests for the RLS policies and triggers.
+  #   docker compose --profile tools run --rm db-test
+  # ---------------------------------------------------------------------------
+  db-test:
+    profiles: ["tools"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: validate
+      POSTGRES_DB: validate
+    volumes:
+      - ./supabase:/supabase:ro
+      - ./scripts/test-rls.sh:/test-rls.sh:ro
+    entrypoint: ["/bin/sh", "/test-rls.sh"]
+
+volumes:
+  node_modules:
+  next_cache:
+  next_cache_ci:
